@@ -1,0 +1,113 @@
+// server.js
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
+const cors = require('cors');
+
+const app = express();
+app.use(cors({ origin: '*' })); // Permissive CORS for Render and subdomains
+
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: {
+    origin: '*',
+    methods: ['GET', 'POST'],
+  },
+  // Keep connections alive
+  pingTimeout: 60000,
+  pingInterval: 25000,
+});
+
+// Store room data: messages, participants, etc.
+const rooms = new Map(); // roomId -> { messages: [], participants: Set() }
+
+io.on('connection', (socket) => {
+  console.log(`User ${socket.id} connected`);
+
+  // Join a room (for calls or live streams)
+  socket.on('join-room', ({ roomId, userId, isBroadcaster = false }) => {
+    socket.join(roomId);
+    socket.data.roomId = roomId;
+    socket.data.userId = userId;
+    socket.data.isBroadcaster = isBroadcaster;
+
+    if (!rooms.has(roomId)) {
+      rooms.set(roomId, { messages: [], participants: new Set() });
+    }
+    const room = rooms.get(roomId);
+    room.participants.add(userId);
+
+    // Send chat history (last 50 messages)
+    socket.emit('chat-history', room.messages.slice(-50));
+
+    // Notify others in the room about the new participant
+    socket.to(roomId).emit('user-joined', { userId, isBroadcaster });
+    // Also send the list of current participants to the new joiner
+    const participantsList = Array.from(room.participants);
+    socket.emit('participants-list', participantsList);
+  });
+
+  // Handle WebRTC signaling (offer, answer, ice-candidate)
+  socket.on('signal', ({ roomId, toUserId, signal, fromUserId }) => {
+    // Forward signal to the target user (or broadcast to all in the room)
+    if (toUserId) {
+      // 1-to-1: send to specific user
+      io.to(roomId).emit('signal', { fromUserId, signal, toUserId });
+    } else {
+      // Broadcast to everyone else in the room (for group/live)
+      socket.to(roomId).emit('signal', { fromUserId, signal, toUserId: null });
+    }
+  });
+
+  // Handle chat messages
+  socket.on('chat-message', ({ roomId, message, userId, username }) => {
+    const room = rooms.get(roomId);
+    if (!room) return;
+    const msgObj = {
+      userId,
+      username,
+      message,
+      timestamp: Date.now(),
+    };
+    room.messages.push(msgObj);
+    // Keep only last 100 messages to save memory
+    if (room.messages.length > 100) room.messages.shift();
+    // Broadcast to all in room
+    io.to(roomId).emit('new-chat-message', msgObj);
+  });
+
+  // Handle leaving a room
+  socket.on('leave-room', ({ roomId, userId }) => {
+    socket.leave(roomId);
+    const room = rooms.get(roomId);
+    if (room) {
+      room.participants.delete(userId);
+      socket.to(roomId).emit('user-left', { userId });
+      if (room.participants.size === 0) {
+        rooms.delete(roomId); // clean up empty rooms
+      }
+    }
+  });
+
+  // Disconnect
+  socket.on('disconnect', () => {
+    console.log(`User ${socket.id} disconnected`);
+    const roomId = socket.data.roomId;
+    const userId = socket.data.userId;
+    if (roomId && userId) {
+      const room = rooms.get(roomId);
+      if (room) {
+        room.participants.delete(userId);
+        socket.to(roomId).emit('user-left', { userId });
+        if (room.participants.size === 0) {
+          rooms.delete(roomId);
+        }
+      }
+    }
+  });
+});
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+  console.log(`Signaling server running on port ${PORT}`);
+});
